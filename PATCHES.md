@@ -30,7 +30,7 @@ Los parches también están en `patches/` como ficheros `.patch` aplicables a la
 2. Extraerlo en una carpeta nueva.
 3. Aplicar los parches de `patches/` con `git apply` (comprobar que el ancla siga existiendo).
 4. Si upstream cambió las líneas, rebasar los parches a mano y actualizar los `.patch`.
-5. `py_compile` de los tres ficheros.
+5. `py_compile` de los cinco ficheros (`main.py`, `headers.py`, `middleware.py`, `context_compaction.py`, `chats.py`).
 6. Probar en un contenedor aislado con copia de la base de datos.
 7. Commit en este repo y construir la imagen desde aquí.
 
@@ -38,6 +38,17 @@ Los parches también están en `patches/` como ficheros `.patch` aplicables a la
 
 La imagen de producción se construye desde este repositorio (Dockerfile del propio
 Open WebUI). No usar `latest`: fijar tag/digest.
+
+## Estado en producción (2026-11-14)
+
+- Servidor **juancdpxx-2cpu**, stack 3, Open WebUI **0.13.3**, `/health` 200.
+- Producción usa **bind-mounts** de estos ficheros (aún no imagen construida desde el repo):
+  `main.py`, `headers.py`, `middleware.py`, `context_compaction.py` y `chats.py`.
+- Modelo de compactación: `FREE-LLM/.nemotron-3.5-lightning-30b-a3b`; si falla, fallback a
+  `deepseek-flash`; trozo máximo 40.000 tokens.
+- Watchdogs: `openwebui-watchdog.timer` (avisa por Telegram) y `docker-health-recovery.timer`
+  (reinicia). El viejo `/root/watchdog4` está retirado.
+- Los 6 arreglos de compactación del 14-11 están desplegados y probados.
 
 ## Notas
 
