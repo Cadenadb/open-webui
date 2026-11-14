@@ -86,6 +86,9 @@ async def compact_messages_for_request(
             metadata.get('chat_id'),
             len(recent_messages),
         )
+        # Last resort: trim the retained tool outputs (in-memory only) so the
+        # request fits the model instead of failing with a context error.
+        _trim_large_outputs(recent_messages, 4000)
 
     event_emitter = None
     if metadata.get('chat_id') and metadata.get('message_id'):
@@ -443,6 +446,65 @@ def _find_compaction_boundary(
     return boundary
 
 
+def _model_context_limit(models: dict, model_id: str, default: int = 131072) -> int:
+    """Best-effort context window for the model, from the catalog metadata."""
+    info = (models.get(model_id) or {}).get('info') or {}
+    sources = [info.get('meta') or {}, info.get('params') or {}, info]
+    for source in sources:
+        for key in ('context_window', 'context_length', 'max_context_length', 'num_ctx'):
+            value = source.get(key)
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return default
+
+
+def _split_messages_for_summary(messages: list[dict], max_tokens: int) -> list[list[dict]]:
+    """Split messages into chunks whose estimated size fits max_tokens."""
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    total = 0
+    for message in messages:
+        size = _estimate_messages_tokens([message])
+        if current and total + size > max_tokens:
+            chunks.append(current)
+            current = []
+            total = 0
+        current.append(message)
+        total += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _trim_large_outputs(messages: list[dict], limit: int = 8000) -> None:
+    """Truncate huge tool outputs in-memory (never persisted) so a request can fit."""
+
+    def trim(value: Any) -> Any:
+        if isinstance(value, str):
+            if len(value) > limit:
+                head = limit * 3 // 4
+                tail = limit // 4
+                return (
+                    value[:head]
+                    + f'\n...[RECORTADO: {len(value)} caracteres originales para compactar]...\n'
+                    + value[-tail:]
+                )
+            return value
+        if isinstance(value, list):
+            return [trim(item) for item in value]
+        if isinstance(value, dict):
+            return {key: trim(item) for key, item in value.items()}
+        return value
+
+    for message in messages:
+        if isinstance(message.get('output'), (list, dict, str)):
+            message['output'] = trim(message['output'])
+
+
 async def _generate_summary(
     request,
     form_data: dict | None,
@@ -469,6 +531,10 @@ async def _generate_summary(
     if task_model_id not in models:
         raise ValueError('No available model for context compaction')
 
+    # Keep every summarizer request inside the model's context window.
+    context_limit = _model_context_limit(models, task_model_id)
+    summary_budget = max(8000, int(context_limit * 0.6))
+
     summary_prompt_template = summary_prompt_template.strip() or DEFAULT_CONTEXT_COMPACTION_PROMPT
     recent_message_prefix = _message_prefix(recent_messages[0])
     has_unique_prefix = (
@@ -488,6 +554,10 @@ async def _generate_summary(
                     'content': f'{get_content_from_message(message) or ""}\n[TOOL CALLS] {JSONCodec.dumps(message["tool_calls"])}',
                 }
 
+    # Never let a single huge tool output blow up the summarizer request.
+    _trim_large_outputs(compacted_messages, 8000)
+    _trim_large_outputs(recent_messages, 8000)
+
     async def render_prompt(template: str) -> str:
         all_messages = [*compacted_messages, *recent_messages]
         prompt = replace_prompt_variable(template, get_last_user_message(all_messages) or '')
@@ -495,6 +565,23 @@ async def _generate_summary(
         prompt = replace_messages_variable(prompt, compacted_messages, 'COMPACTED_MESSAGES')
         prompt = replace_messages_variable(prompt, recent_messages, 'RECENT_MESSAGES')
         prompt = prompt_variables_template(prompt, {'{{PREVIOUS_SUMMARY}}': previous_summary or ''})
+        return await prompt_template(prompt, user)
+
+    async def render_chunk_prompt(
+        all_messages: list[dict],
+        chunk: list[dict],
+        recent: list[dict],
+        carry: str | None,
+        index: int,
+        total: int,
+    ) -> str:
+        prompt = replace_prompt_variable(summary_prompt_template, get_last_user_message(all_messages) or '')
+        prompt = replace_messages_variable(prompt, all_messages)
+        prompt = replace_messages_variable(prompt, chunk, 'COMPACTED_MESSAGES')
+        prompt = replace_messages_variable(prompt, recent, 'RECENT_MESSAGES')
+        prompt = prompt_variables_template(prompt, {'{{PREVIOUS_SUMMARY}}': carry or ''})
+        if total > 1:
+            prompt += f'\n\n(Parte {index} de {total}: resume solo esta parte de la conversación.)'
         return await prompt_template(prompt, user)
 
     task_model_params = task_config.get('task.model.params') or {}
@@ -513,6 +600,7 @@ async def _generate_summary(
         form_data
         and task_model_id == model_id
         and has_unique_prefix
+        and _estimate_messages_tokens(form_data['messages']) <= summary_budget
         and sum(_message_prefix(message) == recent_message_prefix for message in form_data['messages']) == 1
     ):
         prompt = await render_prompt(
@@ -550,19 +638,36 @@ async def _generate_summary(
         if summary:
             return summary
 
-    prompt = await render_prompt(summary_prompt_template)
-    payload = {
-        'model': task_model_id,
-        'messages': [{'role': 'user', 'content': prompt}],
-        'stream': False,
-        'metadata': metadata,
-    }
+    # Chunked summarization: no summarizer request may exceed the model's context.
+    chunks = _split_messages_for_summary(compacted_messages, summary_budget)
+    if not chunks:
+        chunks = [compacted_messages]
 
-    payload = apply_params_to_form_data(payload, models[task_model_id], task_model_params)
-    response = await generate_chat_completion(request, form_data=payload, user=user)
-    summary = _response_text(response).strip()
-    if summary:
-        return summary
+    carry = previous_summary
+    summaries = []
+    total_chunks = len(chunks)
+    for index, chunk in enumerate(chunks, 1):
+        chunk_recent = recent_messages if total_chunks == 1 else []
+        all_messages = [*chunk, *chunk_recent]
+        chunk_prompt = await render_chunk_prompt(all_messages, chunk, chunk_recent, carry, index, total_chunks)
+        payload = {
+            'model': task_model_id,
+            'messages': [{'role': 'user', 'content': chunk_prompt}],
+            'stream': False,
+            'metadata': metadata,
+        }
+        payload = apply_params_to_form_data(payload, models[task_model_id], task_model_params)
+        try:
+            response = await generate_chat_completion(request, form_data=payload, user=user)
+        except Exception:
+            response = None
+        summary = _response_text(response).strip()
+        if summary:
+            summaries.append(summary)
+            carry = summary
+
+    if summaries:
+        return '\n\n'.join(summaries)[:8000]
 
     parts = [previous_summary] if previous_summary else []
     for message in compacted_messages:
