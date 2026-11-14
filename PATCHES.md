@@ -17,8 +17,9 @@ actualizaciones del repositorio oficial **no modifican este código**.
 | 01 | `backend/open_webui/main.py` | Añade el router `personal_autonomy` (2 líneas) tras `prompts.router`. Necesario para el stack de autonomía | Parche propio |
 | 02 | `backend/open_webui/utils/headers.py` | **U01**: si `x-opencode-session` va vacío, envía `owui` (el proveedor OpenCode lo exige) | Parche propio |
 | 03 | `backend/open_webui/utils/middleware.py` | **OWUI-SKILLS-ASSIGNED**: `available_skills` solo lista las skills asignadas al modelo o mencionadas (antes listaba TODAS las activas) | Parche propio |
-| 04 | `backend/open_webui/utils/context_compaction.py` | Compactación: umbral `max(usage, estimación real)`, resumen **por trozos** (máx. 40.000 tokens), recorte de `output` (8.000 al resumir / 4.000 en lo retenido), **fallback al modelo del chat** si el modelo de compactación falla, PR #34151 y PR #32782 adaptado. Modelo de compactación: `FREE-LLM/.nemotron-3.5-lightning-30b-a3b` con respaldo `deepseek-flash` | Comunidad + propio |
-| 05 | `backend/open_webui/utils/middleware.py` | PR #34151: `metadata['context_summary']` para conservar el resumen en tool-loops | Upstream |
+| 04 | `backend/open_webui/utils/context_compaction.py` | Compactación: umbral `max(usage, estimación real)`, umbral por contexto del modelo (85 %), resumen **por trozos** (máx. 40.000), recorte de `output`, **boundary=0**, **cap por mensaje**, **tools contados**, **guard post-inyección (memoria/RAG)**, **fallback al modelo del chat**; PR #34151 y PR #32782. Modelo: `FREE-LLM/.nemotron-3.5-lightning-30b-a3b` con respaldo `deepseek-flash` | Comunidad + propio |
+| 05 | `backend/open_webui/utils/middleware.py` | PR #34151 (`metadata['context_summary']`), **tope de salidas** (`limit_tool_outputs`) y **guard post-inyección** (`enforce_context_budget`) | Upstream + propio |
+| 06 | `backend/open_webui/routers/chats.py` | Medidor de contexto con `max(usage, estimación)` y params del modelo (`app.state.MODELS`) | Propio |
 
 Los parches también están en `patches/` como ficheros `.patch` aplicables a la base v0.13.3.
 
