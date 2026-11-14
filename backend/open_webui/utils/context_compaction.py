@@ -294,12 +294,9 @@ def _resolve_token_threshold(
 ) -> int:
     configured_threshold = _parse_positive_int((metadata.get('params') or {}).get('compact_token_threshold'))
     threshold = configured_threshold or global_threshold
-    if not configured_threshold:
-        # Many base models do not expose their context window. Assume a
-        # conservative 131k so they compact before overflowing instead of
-        # waiting for the global 850k. Explicit per-model values win.
-        if not model_context or model_context <= 0:
-            model_context = 131072
+    if not configured_threshold and model_context and model_context > 0:
+        # Only cap when the model actually exposes its context window;
+        # models the user does not use are left on the global value.
         threshold = min(threshold, int(model_context * 0.85))
     return min(threshold, global_cap)
 
