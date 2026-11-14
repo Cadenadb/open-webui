@@ -89,7 +89,7 @@ from open_webui.utils.auth import get_verified_user_by_id
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.chat_id import is_saved_chat_id, is_temporary_chat_id
 from open_webui.utils.code_interpreter import execute_code_jupyter
-from open_webui.utils.context_compaction import apply_summary_checkpoint, compact_messages_for_request
+from open_webui.utils.context_compaction import apply_summary_checkpoint, compact_messages_for_request, limit_tool_outputs
 from open_webui.utils.files import (
     convert_markdown_base64_images,
     get_file_url_from_base64,
@@ -2143,6 +2143,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     )
     compaction_messages = None
     context_summary = None
+    # Safety cap: never build a request with multi-megabyte tool outputs.
+    limit_tool_outputs(form_data.get('messages') or [])
     if (is_saved_chat_id(chat_id) or is_temporary_chat_id(chat_id)) and user_message_id:
         system_message = get_system_message(form_data.get('messages', []))
         chat_system_prompt = get_content_from_message(system_message) if system_message else ''

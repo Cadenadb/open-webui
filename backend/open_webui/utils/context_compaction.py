@@ -63,8 +63,12 @@ async def compact_messages_for_request(
 
     messages, previous_summary = _apply_latest_summary_checkpoint(messages)
     system_prompt = system_prompt or (get_content_from_message(system_messages[0]) if system_messages else '')
-    token_threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
-    if not _exceeds_token_threshold(messages, system_prompt, previous_summary, token_threshold):
+    tools_tokens = _estimate_tokens((form_data or {}).get('tools'))
+    model_context = _model_context_limit_or_none(models, model_id)
+    token_threshold = _resolve_token_threshold(
+        config['token_threshold'], config['token_cap'], metadata, model_context
+    )
+    if not _exceeds_token_threshold(messages, system_prompt, previous_summary, token_threshold, tools_tokens):
         return [*system_messages, *messages], previous_summary, []
 
     # A tool loop's messages carry the turn's summary only in the system message.
@@ -74,9 +78,21 @@ async def compact_messages_for_request(
     compacted_messages = messages[:boundary]
     recent_messages = messages[boundary:]
     if not compacted_messages or not recent_messages:
-        return [*system_messages, *messages], previous_summary, []
+        # A short chat whose heavy message is the retained one has no boundary
+        # to cut; trim its tool outputs so the request still fits.
+        if (
+            _estimate_context_tokens(recent_messages or messages, system_prompt, previous_summary, tools_tokens)
+            > token_threshold
+        ):
+            log.warning(
+                'Compaction boundary is empty for chat=%s; trimming retained tool outputs',
+                metadata.get('chat_id'),
+            )
+            _trim_large_outputs(recent_messages or messages, 4000)
+            _cap_messages(recent_messages or messages, token_threshold)
+        return [*system_messages, *(recent_messages or messages)], previous_summary, []
 
-    if _estimate_context_tokens(recent_messages, system_prompt, previous_summary) > token_threshold:
+    if _estimate_context_tokens(recent_messages, system_prompt, previous_summary, tools_tokens) > token_threshold:
         # The heaviest messages sit after the last whole-turn boundary, so no
         # boundary can drop them. Warn instead of silently shipping a request
         # that is still over the cap.
@@ -89,6 +105,7 @@ async def compact_messages_for_request(
         # Last resort: trim the retained tool outputs (in-memory only) so the
         # request fits the model instead of failing with a context error.
         _trim_large_outputs(recent_messages, 4000)
+        _cap_messages(recent_messages, token_threshold)
 
     event_emitter = None
     if metadata.get('chat_id') and metadata.get('message_id'):
@@ -272,9 +289,15 @@ def _clamp_retention_percentage(value: Any) -> int:
     return min(50, max(10, parsed))
 
 
-def _resolve_token_threshold(global_threshold: int, global_cap: int, metadata: dict) -> int:
+def _resolve_token_threshold(
+    global_threshold: int, global_cap: int, metadata: dict, model_context: int | None = None
+) -> int:
     configured_threshold = _parse_positive_int((metadata.get('params') or {}).get('compact_token_threshold'))
-    return min(configured_threshold or global_threshold, global_cap)
+    threshold = configured_threshold or global_threshold
+    if not configured_threshold and model_context and model_context > 0:
+        # Leave headroom for the system prompt, tools and the completion.
+        threshold = min(threshold, int(model_context * 0.85))
+    return min(threshold, global_cap)
 
 
 def _usage_token_count(usage: dict) -> int:
@@ -324,7 +347,8 @@ async def get_chat_context_usage(chat: Any, model_id: str | None = None) -> dict
         usage = messages[idx].get('usage') or (messages[idx].get('info') or {}).get('usage')
         if isinstance(usage, dict) and (tokens := _usage_token_count(usage)):
             tokens += _estimate_messages_tokens(messages[idx + 1 :])
-            return _build_context_usage(tokens, threshold)
+            estimated = _estimate_tokens(previous_summary or '') + _estimate_messages_tokens(messages)
+            return _build_context_usage(max(tokens, estimated), threshold)
 
     tokens = _estimate_tokens(previous_summary or '') + _estimate_messages_tokens(messages)
     return _build_context_usage(tokens, threshold)
@@ -392,11 +416,20 @@ def _apply_latest_summary_checkpoint(messages: list[dict]) -> tuple[list[dict], 
     return messages, None
 
 
-def _estimate_context_tokens(messages: list[dict], system_prompt: str, summary: str | None) -> int:
-    return _estimate_tokens(system_prompt) + _estimate_tokens(summary or '') + _estimate_messages_tokens(messages)
+def _estimate_context_tokens(
+    messages: list[dict], system_prompt: str, summary: str | None, extra_tokens: int = 0
+) -> int:
+    return (
+        _estimate_tokens(system_prompt)
+        + _estimate_tokens(summary or '')
+        + _estimate_messages_tokens(messages)
+        + max(0, extra_tokens)
+    )
 
 
-def _exceeds_token_threshold(messages: list[dict], system_prompt: str, summary: str | None, threshold: int) -> bool:
+def _exceeds_token_threshold(
+    messages: list[dict], system_prompt: str, summary: str | None, threshold: int, extra_tokens: int = 0
+) -> bool:
     if threshold <= 0:
         return False
 
@@ -407,10 +440,10 @@ def _exceeds_token_threshold(messages: list[dict], system_prompt: str, summary: 
             # Tool outputs are attached to earlier messages afterwards, so the
             # real payload can be far larger: compare both and use the bigger.
             usage_based = tokens + _estimate_messages_tokens(messages[idx + 1 :])
-            estimated = _estimate_context_tokens(messages, system_prompt, summary)
+            estimated = _estimate_context_tokens(messages, system_prompt, summary, extra_tokens)
             return max(usage_based, estimated) > threshold
 
-    return _estimate_context_tokens(messages, system_prompt, summary) > threshold
+    return _estimate_context_tokens(messages, system_prompt, summary, extra_tokens) > threshold
 
 
 def _find_compaction_boundary(
@@ -451,8 +484,8 @@ def _find_compaction_boundary(
     return boundary
 
 
-def _model_context_limit(models: dict, model_id: str, default: int = 131072) -> int:
-    """Best-effort context window for the model, from the catalog metadata."""
+def _model_context_limit_or_none(models: dict, model_id: str) -> int | None:
+    """Context window from the catalog metadata, or None when unknown."""
     info = (models.get(model_id) or {}).get('info') or {}
     sources = [info.get('meta') or {}, info.get('params') or {}, info]
     for source in sources:
@@ -464,7 +497,12 @@ def _model_context_limit(models: dict, model_id: str, default: int = 131072) -> 
                 continue
             if value > 0:
                 return value
-    return default
+    return None
+
+
+def _model_context_limit(models: dict, model_id: str, default: int = 131072) -> int:
+    """Best-effort context window for the model, from the catalog metadata."""
+    return _model_context_limit_or_none(models, model_id) or default
 
 
 def _split_messages_for_summary(messages: list[dict], max_tokens: int) -> list[list[dict]]:
@@ -508,6 +546,34 @@ def _trim_large_outputs(messages: list[dict], limit: int = 8000) -> None:
     for message in messages:
         if isinstance(message.get('output'), (list, dict, str)):
             message['output'] = trim(message['output'])
+
+
+def _count_strings(value: Any) -> int:
+    if isinstance(value, str):
+        return 1
+    if isinstance(value, list):
+        return sum(_count_strings(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_count_strings(item) for item in value.values())
+    return 0
+
+
+def _cap_messages(messages: list[dict], max_tokens: int) -> None:
+    """Bound each individual message so a single row cannot exceed a chunk."""
+    for message in messages:
+        if _estimate_messages_tokens([message]) <= max_tokens:
+            continue
+        count = max(1, _count_strings(message.get('output')))
+        limit = max(500, (max_tokens * 4) // count)
+        _trim_large_outputs([message], limit)
+        if _estimate_messages_tokens([message]) > max_tokens:
+            log.warning('Message still exceeds %d estimated tokens after capping its output', max_tokens)
+
+
+def limit_tool_outputs(messages: list[dict], max_chars: int = 200000, max_tokens: int = 50000) -> None:
+    """Safety cap for tool outputs before building the request (never persisted)."""
+    _trim_large_outputs(messages, max_chars)
+    _cap_messages(messages, max_tokens)
 
 
 def _usable_summary(text: str) -> bool:
@@ -657,6 +723,7 @@ async def _generate_summary(
         summarizer_model: str, params: dict, previous: str | None
     ) -> tuple[list[str], int]:
         budget = max(8000, min(int(_model_context_limit(models, summarizer_model) * 0.6), 40000))
+        _cap_messages(compacted_messages, budget)
         chunks = _split_messages_for_summary(compacted_messages, budget)
         if not chunks:
             chunks = [compacted_messages]
