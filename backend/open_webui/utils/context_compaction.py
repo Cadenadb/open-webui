@@ -294,8 +294,12 @@ def _resolve_token_threshold(
 ) -> int:
     configured_threshold = _parse_positive_int((metadata.get('params') or {}).get('compact_token_threshold'))
     threshold = configured_threshold or global_threshold
-    if not configured_threshold and model_context and model_context > 0:
-        # Leave headroom for the system prompt, tools and the completion.
+    if not configured_threshold:
+        # Many base models do not expose their context window. Assume a
+        # conservative 131k so they compact before overflowing instead of
+        # waiting for the global 850k. Explicit per-model values win.
+        if not model_context or model_context <= 0:
+            model_context = 131072
         threshold = min(threshold, int(model_context * 0.85))
     return min(threshold, global_cap)
 
@@ -317,8 +321,11 @@ def _usage_token_count(usage: dict) -> int:
     return prompt_tokens + completion_tokens
 
 
-async def get_chat_context_usage(chat: Any, model_id: str | None = None) -> dict | None:
+async def get_chat_context_usage(chat: Any, model_id: str | None = None, models: dict | None = None) -> dict | None:
     chat_data = chat.chat or {}
+    if not model_id:
+        chat_models = chat_data.get('models') or []
+        model_id = chat_models[0] if chat_models else None
     history = chat_data.get('history') or {}
     current_id = getattr(chat, 'current_message_id', None) or history.get('currentId')
     if not current_id:
@@ -338,9 +345,18 @@ async def get_chat_context_usage(chat: Any, model_id: str | None = None) -> dict
         return None
 
     params = ((chat.chat or {}).get('params') or {}).copy()
+    model_info = ((models or {}).get(model_id) or {}).get('info') or {}
+    model_params = model_info.get('params') or {}
+    if isinstance(model_params, dict):
+        params = {**model_params, **params}
     if model_id:
         params['model'] = model_id
-    threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], {'params': params})
+    threshold = _resolve_token_threshold(
+        config['token_threshold'],
+        config['token_cap'],
+        {'params': params},
+        _model_context_limit_or_none(models or {}, model_id) if models else None,
+    )
     messages, previous_summary = _apply_latest_summary_checkpoint(messages)
 
     for idx in range(len(messages) - 1, -1, -1):
