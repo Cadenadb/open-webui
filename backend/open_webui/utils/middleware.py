@@ -3045,6 +3045,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             summary_content = f'[CONVERSATION SUMMARY]\n{context_summary}'
             form_data['messages'] = add_or_update_system_message(summary_content, form_data['messages'], append=True)
 
+    # Keep the tool-loop summary available to the next compaction (upstream PR #34151).
+    metadata['context_summary'] = context_summary
     return form_data, metadata, events, False
 
 

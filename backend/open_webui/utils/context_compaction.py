@@ -67,11 +67,25 @@ async def compact_messages_for_request(
     if not _exceeds_token_threshold(messages, system_prompt, previous_summary, token_threshold):
         return [*system_messages, *messages], previous_summary, []
 
-    boundary = _find_compaction_boundary(messages, config['retention_percentage'])
+    # A tool loop's messages carry the turn's summary only in the system message.
+    previous_summary = previous_summary or metadata.get('context_summary')
+
+    boundary = _find_compaction_boundary(messages, config['retention_percentage'], token_threshold)
     compacted_messages = messages[:boundary]
     recent_messages = messages[boundary:]
     if not compacted_messages or not recent_messages:
         return [*system_messages, *messages], previous_summary, []
+
+    if _estimate_context_tokens(recent_messages, system_prompt, previous_summary) > token_threshold:
+        # The heaviest messages sit after the last whole-turn boundary, so no
+        # boundary can drop them. Warn instead of silently shipping a request
+        # that is still over the cap.
+        log.warning(
+            'Kept context still exceeds the token threshold after compaction for chat=%s (kept=%d messages); '
+            'the heaviest messages sit after the last whole-turn boundary',
+            metadata.get('chat_id'),
+            len(recent_messages),
+        )
 
     event_emitter = None
     if metadata.get('chat_id') and metadata.get('message_id'):
@@ -375,6 +389,10 @@ def _apply_latest_summary_checkpoint(messages: list[dict]) -> tuple[list[dict], 
     return messages, None
 
 
+def _estimate_context_tokens(messages: list[dict], system_prompt: str, summary: str | None) -> int:
+    return _estimate_tokens(system_prompt) + _estimate_tokens(summary or '') + _estimate_messages_tokens(messages)
+
+
 def _exceeds_token_threshold(messages: list[dict], system_prompt: str, summary: str | None, threshold: int) -> bool:
     if threshold <= 0:
         return False
@@ -384,11 +402,12 @@ def _exceeds_token_threshold(messages: list[dict], system_prompt: str, summary: 
         if isinstance(usage, dict) and (tokens := _usage_token_count(usage)):
             return tokens + _estimate_messages_tokens(messages[idx + 1 :]) > threshold
 
-    estimated = _estimate_tokens(system_prompt) + _estimate_tokens(summary or '') + _estimate_messages_tokens(messages)
-    return estimated > threshold
+    return _estimate_context_tokens(messages, system_prompt, summary) > threshold
 
 
-def _find_compaction_boundary(messages: list[dict], retention_percentage: int = 40) -> int:
+def _find_compaction_boundary(
+    messages: list[dict], retention_percentage: int = 40, token_threshold: int | None = None
+) -> int:
     retention_percentage = _clamp_retention_percentage(retention_percentage)
     keep_count = max(2, len(messages) * retention_percentage // 100)
     target = max(1, len(messages) - keep_count)
@@ -403,7 +422,25 @@ def _find_compaction_boundary(messages: list[dict], retention_percentage: int = 
         boundaries = [idx for idx, message in enumerate(messages) if message.get('role') == 'user'][1:]
         # The first later user turn stays a valid boundary even inside the retained share.
         target = max(target, min(boundaries, default=0))
-    return next((idx for idx in reversed(boundaries) if idx <= target), 0)
+    boundary = next((idx for idx in reversed(boundaries) if idx <= target), 0)
+
+    # A count-based boundary can keep a tail that is still over the token cap
+    # when recent messages are disproportionately heavy (a tool-loop blob in
+    # the latest assistant row). Deepen the boundary, dropping whole turns,
+    # until the kept tail fits, keeping at least the tail after the last
+    # whole-turn boundary.
+    if token_threshold is not None and token_threshold > 0 and messages[boundary:]:
+        remaining = _estimate_messages_tokens(messages[boundary:])
+        if remaining > token_threshold:
+            previous = boundary
+            for idx in (idx for idx in boundaries if idx > boundary):
+                remaining -= _estimate_messages_tokens(messages[previous:idx])
+                previous = idx
+                if remaining <= token_threshold:
+                    break
+            boundary = previous
+
+    return boundary
 
 
 async def _generate_summary(
