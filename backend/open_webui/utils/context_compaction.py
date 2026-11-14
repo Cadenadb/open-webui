@@ -538,7 +538,8 @@ async def _generate_summary(
 
     # Keep every summarizer request inside the model's context window.
     context_limit = _model_context_limit(models, task_model_id)
-    summary_budget = max(8000, int(context_limit * 0.6))
+    # Cap the chunk: free/remote providers time out on very large requests.
+    summary_budget = max(8000, min(int(context_limit * 0.6), 40000))
 
     summary_prompt_template = summary_prompt_template.strip() or DEFAULT_CONTEXT_COMPACTION_PROMPT
     recent_message_prefix = _message_prefix(recent_messages[0])
