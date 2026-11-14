@@ -17,6 +17,8 @@ actualizaciones del repositorio oficial **no modifican este código**.
 | 01 | `backend/open_webui/main.py` | Añade el router `personal_autonomy` (2 líneas) tras `prompts.router`. Necesario para el stack de autonomía | Parche propio |
 | 02 | `backend/open_webui/utils/headers.py` | **U01**: si `x-opencode-session` va vacío, envía `owui` (el proveedor OpenCode lo exige) | Parche propio |
 | 03 | `backend/open_webui/utils/middleware.py` | **OWUI-SKILLS-ASSIGNED**: `available_skills` solo lista las skills asignadas al modelo o mencionadas (antes listaba TODAS las activas) | Parche propio |
+| 04 | `backend/open_webui/utils/context_compaction.py` | Compactación: umbral `max(usage, estimación real)`, resumen **por trozos**, recorte de `output` (8.000 al resumir / 4.000 en lo retenido), PR #34151 y PR #32782 adaptado | Comunidad + propio |
+| 05 | `backend/open_webui/utils/middleware.py` | PR #34151: `metadata['context_summary']` para conservar el resumen en tool-loops | Upstream |
 
 Los parches también están en `patches/` como ficheros `.patch` aplicables a la base v0.13.3.
 
