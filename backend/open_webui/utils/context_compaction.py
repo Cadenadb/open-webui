@@ -403,7 +403,12 @@ def _exceeds_token_threshold(messages: list[dict], system_prompt: str, summary: 
     for idx in range(len(messages) - 1, -1, -1):
         usage = messages[idx].get('usage') or (messages[idx].get('info') or {}).get('usage')
         if isinstance(usage, dict) and (tokens := _usage_token_count(usage)):
-            return tokens + _estimate_messages_tokens(messages[idx + 1 :]) > threshold
+            # A provider `usage` only describes the request that produced it.
+            # Tool outputs are attached to earlier messages afterwards, so the
+            # real payload can be far larger: compare both and use the bigger.
+            usage_based = tokens + _estimate_messages_tokens(messages[idx + 1 :])
+            estimated = _estimate_context_tokens(messages, system_prompt, summary)
+            return max(usage_based, estimated) > threshold
 
     return _estimate_context_tokens(messages, system_prompt, summary) > threshold
 
