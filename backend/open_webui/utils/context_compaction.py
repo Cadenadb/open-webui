@@ -589,6 +589,40 @@ def limit_tool_outputs(messages: list[dict], max_chars: int = 200000, max_tokens
     _cap_messages(messages, max_tokens)
 
 
+async def enforce_context_budget(messages: list[dict], model_id: str, models: dict, metadata: dict) -> None:
+    """Final guard after memory/RAG injection: trim until the request fits."""
+    config = await _load_config()
+    if not config['enable']:
+        return
+
+    info = ((models or {}).get(model_id) or {}).get('info') or {}
+    params = dict(info.get('params') or {}) if isinstance(info.get('params'), dict) else {}
+    if isinstance(metadata.get('params'), dict):
+        params.update(metadata['params'])
+    threshold = _resolve_token_threshold(
+        config['token_threshold'],
+        config['token_cap'],
+        {'params': params},
+        _model_context_limit_or_none(models or {}, model_id),
+    )
+    if threshold <= 0 or _estimate_context_tokens(messages, '', None) <= threshold:
+        return
+
+    _trim_large_outputs(messages, 4000)
+    _cap_messages(messages, threshold)
+
+    # Memory/RAG are injected as system messages after compaction; cap them.
+    for message in messages[1:]:
+        if message.get('role') != 'system':
+            continue
+        content = message.get('content')
+        if isinstance(content, str) and len(content) > 20000:
+            message['content'] = content[:20000] + '\n...[RECORTADO para ajustar el contexto]...'
+
+    if _estimate_context_tokens(messages, '', None) > threshold:
+        log.warning('Context still exceeds the threshold after post-injection trim (model=%s)', model_id)
+
+
 def _usable_summary(text: str) -> bool:
     """Reject empty, truncated or reasoning-only summaries from a fallback model."""
     if not text or len(text.strip()) < 200:

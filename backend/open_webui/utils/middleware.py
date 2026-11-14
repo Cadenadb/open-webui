@@ -89,7 +89,12 @@ from open_webui.utils.auth import get_verified_user_by_id
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.chat_id import is_saved_chat_id, is_temporary_chat_id
 from open_webui.utils.code_interpreter import execute_code_jupyter
-from open_webui.utils.context_compaction import apply_summary_checkpoint, compact_messages_for_request, limit_tool_outputs
+from open_webui.utils.context_compaction import (
+    apply_summary_checkpoint,
+    compact_messages_for_request,
+    enforce_context_budget,
+    limit_tool_outputs,
+)
 from open_webui.utils.files import (
     convert_markdown_base64_images,
     get_file_url_from_base64,
@@ -2939,6 +2944,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # If context is not empty, insert it into the messages
     if sources and prompt:
         form_data['messages'] = await apply_source_context_to_messages(request, form_data['messages'], sources, prompt)
+
+    # Memory/RAG are injected after compaction; enforce the budget one last time.
+    try:
+        await enforce_context_budget(
+            form_data['messages'], form_data['model'], request.app.state.MODELS, metadata
+        )
+    except Exception:
+        log.exception('Post-injection context budget enforcement failed')
 
     # If there are citations, add them to the data_items
     sources = [
