@@ -510,6 +510,14 @@ def _trim_large_outputs(messages: list[dict], limit: int = 8000) -> None:
             message['output'] = trim(message['output'])
 
 
+def _usable_summary(text: str) -> bool:
+    """Reject empty, truncated or reasoning-only summaries from a fallback model."""
+    if not text or len(text.strip()) < 200:
+        return False
+    head = text.strip().lower()[:80]
+    return not (head.startswith("here's a thinking process") or head.startswith('here is a thinking'))
+
+
 async def _generate_summary(
     request,
     form_data: dict | None,
@@ -641,39 +649,58 @@ async def _generate_summary(
         except Exception:
             response = None
         summary = _response_text(response).strip()
-        if summary:
+        if _usable_summary(summary):
             return summary
 
     # Chunked summarization: no summarizer request may exceed the model's context.
-    chunks = _split_messages_for_summary(compacted_messages, summary_budget)
-    if not chunks:
-        chunks = [compacted_messages]
+    async def summarize_with(
+        summarizer_model: str, params: dict, previous: str | None
+    ) -> tuple[list[str], int]:
+        budget = max(8000, min(int(_model_context_limit(models, summarizer_model) * 0.6), 40000))
+        chunks = _split_messages_for_summary(compacted_messages, budget)
+        if not chunks:
+            chunks = [compacted_messages]
+        carry = previous
+        out: list[str] = []
+        total = len(chunks)
+        for index, chunk in enumerate(chunks, 1):
+            chunk_recent = recent_messages if total == 1 else []
+            all_messages = [*chunk, *chunk_recent]
+            chunk_prompt = await render_chunk_prompt(all_messages, chunk, chunk_recent, carry, index, total)
+            payload = {
+                'model': summarizer_model,
+                'messages': [{'role': 'user', 'content': chunk_prompt}],
+                'stream': False,
+                'metadata': metadata,
+            }
+            payload = apply_params_to_form_data(payload, models[summarizer_model], params)
+            try:
+                response = await generate_chat_completion(request, form_data=payload, user=user)
+            except Exception:
+                response = None
+            text = _response_text(response).strip()
+            if _usable_summary(text):
+                out.append(text)
+                carry = text
+            else:
+                # Do not spend more calls on a failing model; the caller falls back.
+                break
+        return out, total
 
-    carry = previous_summary
-    summaries = []
-    total_chunks = len(chunks)
-    for index, chunk in enumerate(chunks, 1):
-        chunk_recent = recent_messages if total_chunks == 1 else []
-        all_messages = [*chunk, *chunk_recent]
-        chunk_prompt = await render_chunk_prompt(all_messages, chunk, chunk_recent, carry, index, total_chunks)
-        payload = {
-            'model': task_model_id,
-            'messages': [{'role': 'user', 'content': chunk_prompt}],
-            'stream': False,
-            'metadata': metadata,
-        }
-        payload = apply_params_to_form_data(payload, models[task_model_id], task_model_params)
-        try:
-            response = await generate_chat_completion(request, form_data=payload, user=user)
-        except Exception:
-            response = None
-        summary = _response_text(response).strip()
-        if summary:
-            summaries.append(summary)
-            carry = summary
+    summaries, total_chunks = await summarize_with(task_model_id, task_model_params, previous_summary)
+    if len(summaries) < total_chunks and task_model_id != model_id and model_id in models:
+        log.warning(
+            'Compaction model %s produced no usable summary (chat=%s); retrying with chat model %s',
+            task_model_id,
+            metadata.get('chat_id'),
+            model_id,
+        )
+        summaries, total_chunks = await summarize_with(model_id, {}, previous_summary)
 
     if summaries:
         return '\n\n'.join(summaries)[:8000]
+
+    log.warning('Context compaction fell back to an extractive summary (chat=%s)', metadata.get('chat_id'))
 
     parts = [previous_summary] if previous_summary else []
     for message in compacted_messages:
