@@ -1,0 +1,12 @@
+--- a/backend/open_webui/main.py
++++ b/backend/open_webui/main.py
+@@ -849,6 +849,9 @@
+ app.include_router(notifications.router, prefix='/api/v1/notifications', tags=['notifications'])
+ app.include_router(knowledge.router, prefix='/api/v1/knowledge', tags=['knowledge'])
+ app.include_router(prompts.router, prefix='/api/v1/prompts', tags=['prompts'])
++# Local router only; upstream title handling retained.
++from open_webui.personal_autonomy import router as personal_autonomy_router
++app.include_router(personal_autonomy_router, tags=["personal-autonomy"])
+ app.include_router(tools.router, prefix='/api/v1/tools', tags=['tools'])
+ app.include_router(skills.router, prefix='/api/v1/skills', tags=['skills'])
+ 

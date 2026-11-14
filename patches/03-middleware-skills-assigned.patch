@@ -1,0 +1,17 @@
+--- a/backend/open_webui/utils/middleware.py
++++ b/backend/open_webui/utils/middleware.py
+@@ -2503,11 +2503,9 @@
+         db_skill_ids = [sid for sid in skill_ids if not sid.startswith(terminal_skill_prefix)]
+         terminal_skill_ids = [sid for sid in skill_ids if sid.startswith(terminal_skill_prefix)]
+ 
+-        if use_builtin_tools and model_builtin_tools.get('skills', True):
+-            accessible_skills = {s.id: s for s in await SkillsModel.get_skills(user_id=user.id)}
+-            db_skill_ids = sorted(accessible_skills)
+-        else:
+-            accessible_skills = {s.id: s for s in await SkillsModel.get_skills(user_id=user.id, ids=db_skill_ids)}
++        # PATCH OWUI-SKILLS-ASSIGNED (2026-11-14): solo skills asignadas al modelo o mencionadas.
++        accessible_skills = {s.id: s for s in await SkillsModel.get_skills(user_id=user.id, ids=db_skill_ids)}
++        db_skill_ids = sorted(accessible_skills)
+ 
+         for sid in db_skill_ids:
+             skill = accessible_skills.get(sid)

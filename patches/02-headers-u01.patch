@@ -1,0 +1,12 @@
+--- a/backend/open_webui/utils/headers.py
++++ b/backend/open_webui/utils/headers.py
+@@ -166,6 +166,9 @@
+             value = str(value)
+         for token, val in template_vars.items():
+             value = value.replace(token, val)
++        # U01: Zen requires a non-empty session even for detached calls.
++        if value == '' and str(key).lower() == 'x-opencode-session':
++            value = 'owui'
+         # Encode Unicode and controls after substitution; preserve ASCII header syntax and existing escapes.
+         parsed_headers[key] = quote(value, safe=punctuation + ' \t')
+ 
